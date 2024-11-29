@@ -81,10 +81,9 @@ ENV=prod npx cdk deploy
   "username": "your-bluesky-username",
   "password": "your-bluesky-password"
 }
+```
 
-    
-
-🔧 Configuration
+## 🔧 Configuration
 
     FEED_URL: The URL of the RSS feed you want to bridge to Bluesky
     MAX_AGE_HOURS: Maximum age of RSS items to consider (in hours)
@@ -92,29 +91,29 @@ ENV=prod npx cdk deploy
     AI_MODEL_ID: The Bedrock model ID to use for summarization
     AI_SUMMARY_MAX_GRAPHEMES: Maximum length of AI-generated summaries
 
-🤝 Contributing
+## 🤝 Contributing
 
 We welcome contributions to the RSS-Bluesky Bridge project! Here's how you can help:
 
-    Fork the repository
-    Create a new branch (git checkout -b feature/amazing-feature)
-    Make your changes
-    Commit your changes (git commit -am 'Add some amazing feature')
-    Push to the branch (git push origin feature/amazing-feature)
-    Open a Pull Request
+1. Fork the repository
+1. Create a new branch (git checkout -b feature/amazing-feature)
+1. Make your changes
+1. Commit your changes (git commit -am 'Add some amazing feature')
+1. Push to the branch (git push origin feature/amazing-feature)
+1. Open a Pull Request
 
 Please make sure to update tests as appropriate and adhere to the existing coding style.
 📜 License
 
 This project is licensed under the MIT License - see the [LICENSE](https://console.harmony.a2z.com/LICENSE) file for details.
-🙏 Acknowledgements
+## 🙏 Acknowledgements
 
-    [AWS CDK](https://aws.amazon.com/cdk/)
-    [Rust](https://www.rust-lang.org/)
-    [Bluesky](https://bsky.app/)
-    [RSS](https://en.wikipedia.org/wiki/RSS)
+[AWS CDK](https://aws.amazon.com/cdk/)  
+[Rust](https://www.rust-lang.org/)  
+[Bluesky](https://bsky.app/)  
+[RSS](https://en.wikipedia.org/wiki/RSS)  
 
-📞 Support
+## 📞 Support
 
 If you have any questions or need help with setup, please open an issue in the GitHub repository, and we'll be happy to assist you!
 
