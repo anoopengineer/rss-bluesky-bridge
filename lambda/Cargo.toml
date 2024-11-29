@@ -1,0 +1,51 @@
+[package]
+name = "rss-bluesky-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "get-rss-items"
+path = "src/bin/get_rss_items.rs"
+
+[[bin]]
+name = "check-dynamodb"
+path = "src/bin/check_dynamodb.rs"
+
+[[bin]]
+name = "summarize-bedrock"
+path = "src/bin/summarize_bedrock.rs"
+
+[[bin]]
+name = "post-bluesky"
+path = "src/bin/post_bluesky.rs"
+
+[[bin]]
+name = "update-dynamodb"
+path = "src/bin/update_dynamodb.rs"
+
+[[bin]]
+name = "error-check"
+path = "src/bin/error_check.rs"
+
+[dependencies]
+chrono = "0.4.38"
+anyhow = "1.0.93"
+rss = "2.0.11"
+reqwest = { version = "0.12.9", features = ["json"] }
+tokio = { version = "1.41.1", features = ["macros"] }
+lambda_runtime = "0.13.0"
+aws_lambda_events = { version = "0.15.1", default-features = false, features = ["cloudwatch_events"] }
+serde_json = "1.0.133"
+openssl = { version = "0.10.68", features = ["vendored"] }
+serde = "1.0.215"
+aws-config = "1.5.10"
+aws-sdk-dynamodb = "1.54.0"
+aws-sdk-bedrockruntime = "1.61.0"
+bsky-sdk = "0.1.13"
+atrium-api = "0.24.8"
+aws-sdk-secretsmanager = "1.53.0"
+ipld-core = "0.4.1"
+unicode-segmentation = "1.12.0"
