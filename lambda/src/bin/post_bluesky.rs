@@ -13,6 +13,7 @@ use bsky_sdk::rich_text::RichText;
 use bsky_sdk::BskyAgent;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
 use rss_bluesky_bridge::models::ItemIdentifier;
+use rss_bluesky_bridge::repository::DynamoRepository;
 use serde::{Deserialize, Serialize};
 use std::env;
 use tracing_subscriber::EnvFilter;
@@ -62,10 +63,10 @@ impl Config {
     }
 }
 
-#[instrument(skip(event, dynamodb_client, config))]
+#[instrument(skip(event, repo, secrets_client, config))]
 async fn post_bluesky(
     event: LambdaEvent<Input>,
-    dynamodb_client: &DynamoDbClient,
+    repo: &DynamoRepository,
     secrets_client: &SecretsManagerClient,
     config: &Config,
 ) -> Result<Output, Error> {
@@ -75,42 +76,26 @@ async fn post_bluesky(
     );
 
     // Retrieve item data from DynamoDB
-    let result = dynamodb_client
-        .get_item()
-        .table_name(&config.dynamodb_table_name)
-        .key(
-            "PK",
-            aws_sdk_dynamodb::types::AttributeValue::S(
-                event.payload.item_identifier.execution_id.clone(),
-            ),
+    let item = repo
+        .get_execution_item(
+            &event.payload.item_identifier.execution_id,
+            &event.payload.item_identifier.guid,
         )
-        .key(
-            "SK",
-            aws_sdk_dynamodb::types::AttributeValue::S(event.payload.item_identifier.guid.clone()),
-        )
-        .send()
         .await
-        .context("Failed to get item from DynamoDB")
+        .with_context(|| {
+            format!(
+                "Failed to get item from DynamoDB for execution-id {:?} and guid {:?}",
+                event.payload.item_identifier.execution_id, event.payload.item_identifier.guid
+            )
+        })
         .map_err(Error::from)?;
 
-    let item = result
-        .item()
-        .context("Item not found in DynamoDB")
-        .map_err(Error::from)?;
+    let title = item.title.context("Title not found in item")?;
+    let description = item.description.context("Description not found in item")?;
+    let link = item.link.context("Link not found in item")?;
 
-    let title = item
-        .get("title")
-        .and_then(|v| v.as_s().ok())
-        .context("Title not found in item")
-        .map_err(Error::from)?;
-    let description = item
-        .get("description")
-        .and_then(|v| v.as_s().ok())
-        .context("Description not found in item")
-        .map_err(Error::from)?;
-
-    let summary = match item.get("summary").and_then(|v| v.as_s().ok()) {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
+    let summary = match item.summary {
+        Some(s) if !s.trim().is_empty() => s,
         _ => {
             tracing::info!("AI generated summary unavailable. Generating summary from description");
             let words: Vec<&str> = description.split_word_bounds().collect();
@@ -125,17 +110,11 @@ async fn post_bluesky(
             if word_index < words.len() {
                 format!("{}…", words[..word_index].join(""))
             } else {
-                description.to_string()
+                description.clone()
             }
         }
     };
     tracing::info!("Using summary: {}", summary);
-
-    let link = item
-        .get("link")
-        .and_then(|v| v.as_s().ok())
-        .context("Link not found in item")
-        .map_err(Error::from)?;
 
     // Construct the post content
     let post = format!("{}\n\n", summary);
@@ -237,8 +216,9 @@ async fn main() -> Result<(), Error> {
     let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let dynamodb_client = DynamoDbClient::new(&aws_config);
     let secrets_client = SecretsManagerClient::new(&aws_config);
+    let repo = DynamoRepository::new(dynamodb_client, config.dynamodb_table_name.clone());
     run(service_fn(|event: LambdaEvent<Input>| {
-        post_bluesky(event, &dynamodb_client, &secrets_client, &config)
+        post_bluesky(event, &repo, &secrets_client, &config)
     }))
     .await
 }

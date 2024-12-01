@@ -4,7 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
-use rss_bluesky_bridge::models::ItemIdentifier;
+use rss_bluesky_bridge::{models::ItemIdentifier, repository::DynamoRepository};
 use serde::{Deserialize, Serialize};
 use std::env;
 use tracing_subscriber::EnvFilter;
@@ -82,10 +82,10 @@ impl Config {
     }
 }
 
-#[instrument(skip(event, dynamodb_client, bedrock_client, config))]
+#[instrument(skip(event, repo, bedrock_client, config))]
 async fn summarize_bedrock(
     event: LambdaEvent<Input>,
-    dynamodb_client: &DynamoDbClient,
+    repo: &DynamoRepository,
     bedrock_client: &BedrockClient,
     config: &Config,
 ) -> Result<Output, Error> {
@@ -95,37 +95,21 @@ async fn summarize_bedrock(
         });
     }
 
-    //get the ddb entry
     // Retrieve item data from DynamoDB
-    let result = dynamodb_client
-        .get_item()
-        .table_name(&config.dynamodb_table_name)
-        .key(
-            "PK",
-            aws_sdk_dynamodb::types::AttributeValue::S(
-                event.payload.item_identifier.execution_id.clone(),
-            ),
+    let item = repo
+        .get_execution_item(
+            &event.payload.item_identifier.execution_id,
+            &event.payload.item_identifier.guid,
         )
-        .key(
-            "SK",
-            aws_sdk_dynamodb::types::AttributeValue::S(event.payload.item_identifier.guid.clone()),
-        )
-        .send()
         .await
-        .context("Failed to get item from DynamoDB")
-        .map_err(Error::from)?;
+        .with_context(|| {
+            format!(
+                "Failed to get item from DynamoDB for execution-id {:?} and guid {:?}",
+                event.payload.item_identifier.execution_id, event.payload.item_identifier.guid
+            )
+        })?;
 
-    let item = result
-        .item()
-        .context("Item not found in DynamoDB")
-        .map_err(Error::from)?;
-
-    let description = item
-        .get("description")
-        .and_then(|v| v.as_s().ok())
-        .context("Description not found in item")
-        .map_err(Error::from)?;
-
+    let description = item.description.context("Description not found in item")?;
     //get the summary from description
     // Prepare the prompt
     let prompt = format!(
@@ -217,32 +201,14 @@ async fn summarize_bedrock(
         num_graphemes
     );
 
-    //update the ddb entry with a new "summary" column
-
-    let update_result = dynamodb_client
-        .update_item()
-        .table_name(&config.dynamodb_table_name)
-        .key(
-            "PK",
-            aws_sdk_dynamodb::types::AttributeValue::S(
-                event.payload.item_identifier.execution_id.clone(),
-            ),
-        )
-        .key(
-            "SK",
-            aws_sdk_dynamodb::types::AttributeValue::S(event.payload.item_identifier.guid.clone()),
-        )
-        .update_expression("SET summary = :summary")
-        .expression_attribute_values(
-            ":summary",
-            aws_sdk_dynamodb::types::AttributeValue::S(summary.to_string()),
-        )
-        .send()
-        .await
-        .context("Failed to update item in DynamoDB with summary")
-        .map_err(Error::from)?;
-
-    tracing::info!("DynamoDB update result: {:?}", update_result);
+    // Update the DynamoDB entry with the new summary
+    repo.update_execution_item_summary(
+        &event.payload.item_identifier.execution_id,
+        &event.payload.item_identifier.guid,
+        &summary,
+    )
+    .await
+    .context("Failed to update item in DynamoDB with summary")?;
 
     Ok(Output {
         item_identifier: event.payload.item_identifier,
@@ -259,8 +225,9 @@ async fn main() -> Result<(), Error> {
     let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let dynamodb_client = DynamoDbClient::new(&aws_config);
     let bedrock_client = BedrockClient::new(&aws_config);
+    let repo = DynamoRepository::new(dynamodb_client, config.dynamodb_table_name.clone());
     run(service_fn(|event: LambdaEvent<Input>| {
-        summarize_bedrock(event, &dynamodb_client, &bedrock_client, &config)
+        summarize_bedrock(event, &repo, &bedrock_client, &config)
     }))
     .await
 }

@@ -2,12 +2,15 @@ use ::tracing::instrument;
 use anyhow::Context;
 use aws_config::BehaviorVersion;
 use aws_lambda_events::event::cloudwatch_events::CloudWatchEvent;
-use aws_sdk_dynamodb::{types::AttributeValue, Client};
+use aws_sdk_dynamodb::Client;
 use chrono::{DateTime, Duration, Utc};
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
 use reqwest;
 use rss::Channel;
-use rss_bluesky_bridge::models::{ItemIdentifier, RssItem};
+use rss_bluesky_bridge::{
+    models::{ExecutionItem, ItemIdentifier},
+    repository::DynamoRepository,
+};
 use serde::Serialize;
 use std::env;
 use tracing_subscriber::EnvFilter;
@@ -65,10 +68,10 @@ impl Config {
     }
 }
 
-#[instrument(skip(event, dynamodb_client, config))]
+#[instrument(skip(event, repo, config))]
 async fn get_rss_items(
     event: LambdaEvent<CloudWatchEvent>,
-    dynamodb_client: &Client,
+    repo: &DynamoRepository,
     config: &Config,
 ) -> Result<Output, Error> {
     tracing::info!("Payload: {:?}", event.payload);
@@ -91,7 +94,10 @@ async fn get_rss_items(
         .context("Failed to parse RSS feed")
         .map_err(Error::from)?;
 
-    let items: Vec<RssItem> = channel
+    let ttl = Utc::now() + Duration::hours(24);
+    let ttl_timestamp = ttl.timestamp();
+
+    let (execution_items, item_identifiers): (Vec<ExecutionItem>, Vec<ItemIdentifier>) = channel
         .items()
         .iter()
         .filter_map(|item| {
@@ -100,63 +106,32 @@ async fn get_rss_items(
             let age = Utc::now().signed_duration_since(pub_date);
 
             if age.num_hours() <= config.max_age_hours {
-                Some(RssItem {
-                    guid: item.guid()?.value().to_string(),
-                    title: item.title()?.to_string(),
-                    description: item.description()?.to_string(),
-                    link: item.link()?.to_string(),
-                    pub_date: pub_date.to_rfc2822(),
-                })
+                let guid = item.guid()?.value().to_string();
+                Some((
+                    ExecutionItem {
+                        execution_id: execution_id.clone(),
+                        guid: guid.clone(),
+                        title: item.title().map(String::from),
+                        description: item.description().map(String::from),
+                        link: item.link().map(String::from),
+                        summary: None,
+                        ttl: Some(ttl_timestamp),
+                        _type: None,
+                        pub_date: Some(pub_date.to_rfc2822()),
+                    },
+                    ItemIdentifier {
+                        execution_id: execution_id.clone(),
+                        guid,
+                    },
+                ))
             } else {
                 None
             }
         })
-        .collect();
+        .unzip();
 
-    let mut item_identifiers = Vec::new();
-
-    for item in items {
-        let ttl = Utc::now() + Duration::hours(24);
-        let ttl_timestamp = ttl.timestamp();
-
-        // Prepare item data
-        let mut item_data = std::collections::HashMap::new();
-        item_data.insert("PK".to_string(), AttributeValue::S(execution_id.clone()));
-        item_data.insert("SK".to_string(), AttributeValue::S(item.guid.clone()));
-        item_data.insert(
-            "TTL".to_string(),
-            AttributeValue::N(ttl_timestamp.to_string()),
-        );
-
-        // Add other item fields
-        item_data.insert(
-            "title".to_string(),
-            AttributeValue::S(item.title.to_string()),
-        );
-        item_data.insert(
-            "description".to_string(),
-            AttributeValue::S(item.description.to_string()),
-        );
-        item_data.insert("link".to_string(), AttributeValue::S(item.link.to_string()));
-        item_data.insert(
-            "pub_date".to_string(),
-            AttributeValue::S(item.pub_date.to_string()),
-        );
-
-        // Store item in DynamoDB
-        dynamodb_client
-            .put_item()
-            .table_name(&config.dynamodb_table_name)
-            .set_item(Some(item_data))
-            .send()
-            .await?;
-
-        // Add to list of identifiers
-        item_identifiers.push(ItemIdentifier {
-            execution_id: execution_id.clone(),
-            guid: item.guid.clone(),
-        });
-    }
+    // Store items in DynamoDB using bulk API
+    repo.create_execution_items(&execution_items).await?;
 
     Ok(Output { item_identifiers })
 }
@@ -171,9 +146,10 @@ async fn main() -> Result<(), Error> {
     let config = Config::from_env().expect("Failed to load configuration");
     let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let dynamodb_client = Client::new(&aws_config);
+    let repo = DynamoRepository::new(dynamodb_client, config.dynamodb_table_name.clone());
 
     run(service_fn(|event: LambdaEvent<CloudWatchEvent>| {
-        get_rss_items(event, &dynamodb_client, &config)
+        get_rss_items(event, &repo, &config)
     }))
     .await
 }

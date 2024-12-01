@@ -2,7 +2,7 @@ use anyhow::Context;
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
 use lambda_runtime::{run, service_fn, Error, LambdaEvent};
-use rss_bluesky_bridge::{dynamodb_handler, models::ItemIdentifier};
+use rss_bluesky_bridge::{models::ItemIdentifier, repository::DynamoRepository};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 use tracing_subscriber::EnvFilter;
@@ -39,19 +39,18 @@ impl Config {
     }
 }
 
-#[instrument(skip(event, dynamodb_client, config))]
+#[instrument(skip(event, repo))]
 async fn check_dynamodb(
     event: LambdaEvent<Input>,
-    dynamodb_client: &Client,
-    config: &Config,
+    repo: &DynamoRepository,
 ) -> Result<Output, Error> {
     let guid = event.payload.item_identifier.guid.clone();
     tracing::info!("Checking DynamoDB for guid: {}", guid);
 
-    let guid_exists =
-        dynamodb_handler::check_guid_exists(dynamodb_client, &config.dynamodb_table_name, &guid)
-            .await
-            .with_context(|| format!("Failed to check if guid exists in DynamoDB: {}", guid))?;
+    let guid_exists = repo
+        .record_item_exists(&guid)
+        .await
+        .with_context(|| format!("Failed to check if guid exists in DynamoDB: {}", guid))?;
 
     let output = Output {
         item_identifier: event.payload.item_identifier,
@@ -78,8 +77,10 @@ async fn main() -> Result<(), Error> {
     let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let dynamodb_client = Client::new(&aws_config);
 
+    let repo = DynamoRepository::new(dynamodb_client, config.dynamodb_table_name);
+
     run(service_fn(|event: LambdaEvent<Input>| {
-        check_dynamodb(event, &dynamodb_client, &config)
+        check_dynamodb(event, &repo)
     }))
     .await
 }

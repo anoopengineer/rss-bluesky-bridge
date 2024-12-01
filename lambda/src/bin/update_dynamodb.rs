@@ -1,9 +1,12 @@
 use ::tracing::instrument;
 use anyhow::Context;
 use aws_config::BehaviorVersion;
-use aws_sdk_dynamodb::{types::AttributeValue, Client};
+use aws_sdk_dynamodb::Client;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
-use rss_bluesky_bridge::models::ItemIdentifier;
+use rss_bluesky_bridge::{
+    models::{ItemIdentifier, RecordItem},
+    repository::DynamoRepository,
+};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
@@ -37,33 +40,23 @@ impl Config {
         })
     }
 }
-#[instrument(skip(event, dynamodb_client, config))]
+#[instrument(skip(event, repo))]
 async fn update_dynamodb(
     event: LambdaEvent<Input>,
-    dynamodb_client: &Client,
-    config: &Config,
+    repo: &DynamoRepository,
 ) -> Result<Output, Error> {
-    dynamodb_client
-        .put_item()
-        .table_name(&config.dynamodb_table_name)
-        .item(
-            "PK",
-            AttributeValue::S(format!(
-                "guid-{}",
-                event.payload.item_identifier.guid.clone()
-            )),
-        )
-        .item("SK", AttributeValue::S("A".to_string()))
-        .send()
+    let record_item = RecordItem::new(event.payload.item_identifier.guid.clone())
+        .context("Failed to create RecordItem")?;
+
+    repo.create_record_item(&record_item)
         .await
-        .context("Failed to put item in DynamoDB")
-        .map_err(Error::from)?;
+        .context("Failed to create record item in DynamoDB")?;
 
     let output = Output {
         item_identifier: event.payload.item_identifier,
     };
 
-    tracing::info!("Error check result: {:?}", output);
+    tracing::info!("Update result: {:?}", output);
     Ok(output)
 }
 
@@ -77,9 +70,10 @@ async fn main() -> Result<(), Error> {
     let config = Config::from_env().expect("Failed to load configuration");
     let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let dynamodb_client = Client::new(&aws_config);
+    let repo = DynamoRepository::new(dynamodb_client, config.dynamodb_table_name.clone());
 
     run(service_fn(|event: LambdaEvent<Input>| {
-        update_dynamodb(event, &dynamodb_client, &config)
+        update_dynamodb(event, &repo)
     }))
     .await
 }
