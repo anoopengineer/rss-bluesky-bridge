@@ -1,11 +1,7 @@
+use ::tracing::instrument;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
 use serde::{Deserialize, Serialize};
-
-#[derive(Deserialize, Serialize, Clone)]
-struct ItemIdentifier {
-    execution_id: String,
-    guid: String,
-}
+use tracing_subscriber::EnvFilter;
 
 #[derive(Deserialize)]
 struct ProcessedItem {
@@ -25,6 +21,7 @@ struct Output {
     total_items: usize,
 }
 
+#[instrument(skip(event))]
 async fn error_check(event: LambdaEvent<Input>) -> Result<Output, Error> {
     tracing::info!("Checking for errors in processed items");
 
@@ -35,6 +32,11 @@ async fn error_check(event: LambdaEvent<Input>) -> Result<Output, Error> {
         .iter()
         .filter(|item| item.error.is_some())
         .count();
+    tracing::info!(
+        "total_items = {} error_count = {}",
+        total_items,
+        error_count
+    );
 
     let output = Output {
         has_errors: error_count > 0,
@@ -48,6 +50,9 @@ async fn error_check(event: LambdaEvent<Input>) -> Result<Output, Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    tracing::init_default_subscriber();
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
     run(service_fn(error_check)).await
 }

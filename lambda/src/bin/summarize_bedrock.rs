@@ -1,17 +1,16 @@
+use ::tracing::instrument;
 use anyhow::Context;
 use aws_config::BehaviorVersion;
-use aws_sdk_bedrockruntime::Client;
+use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
+use rss_bluesky_bridge::models::ItemIdentifier;
 use serde::{Deserialize, Serialize};
 use std::env;
+use tracing_subscriber::EnvFilter;
 use unicode_segmentation::UnicodeSegmentation;
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
-struct ItemIdentifier {
-    execution_id: String,
-    guid: String,
-}
+const MAX_BSKY_GRAPHEMES: usize = 290;
 
 #[derive(Deserialize)]
 struct Input {
@@ -25,43 +24,82 @@ struct Output {
     item_identifier: ItemIdentifier,
 }
 
-const MAX_BSKY_GRAPHEMES: usize = 300;
+struct Config {
+    dynamodb_table_name: String,
+    enable_ai_summary: bool,
+    ai_model_id: String,
+    ai_summary_max_graphemes: i64,
+}
 
-async fn summarize_bedrock(event: LambdaEvent<Input>) -> Result<Output, Error> {
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let bedrock_client = Client::new(&config);
-    let dynamodb_client = DynamoDbClient::new(&config);
+impl Config {
+    fn from_env() -> Result<Self, Error> {
+        let dynamodb_table_name = std::env::var("DYNAMODB_TABLE_NAME")
+            .context("DYNAMODB_TABLE_NAME environment variable not set")?;
 
-    let table_name = env::var("DYNAMODB_TABLE_NAME")
-        .context("DYNAMODB_TABLE_NAME environment variable not set")
-        .map_err(Error::from)?;
+        if dynamodb_table_name.is_empty() {
+            return Err(Error::from("DYNAMODB_TABLE_NAME cannot be empty"));
+        }
 
-    let enable_ai_summary = env::var("ENABLE_AI_SUMMARY")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
+        let enable_ai_summary = env::var("ENABLE_AI_SUMMARY")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
 
-    if !enable_ai_summary {
+        let ai_summary_max_graphemes: i64 = std::env::var("AI_SUMMARY_MAX_GRAPHEMES")
+            .context("AI_SUMMARY_MAX_GRAPHEMES environment variable not set")
+            .map_err(Error::from)?
+            .parse()
+            .context("Failed to parse AI_SUMMARY_MAX_GRAPHEMES as an integer")
+            .map_err(Error::from)?;
+
+        let ai_model_id: String = env::var("AI_MODEL_ID")
+            .context("AI_MODEL_ID environment variable not set")
+            .map_err(Error::from)?;
+
+        if enable_ai_summary && ai_model_id.trim().is_empty() {
+            return Err(Error::from(
+                "AI Summary is enabled, but AI_MODEL_ID env variable is missing",
+            ));
+        }
+
+        let ai_summary_max_graphemes = if ai_summary_max_graphemes <= 0 {
+            if enable_ai_summary {
+                tracing::warn!(
+                    "AI Summary is enabled, but AI_SUMMARY_MAX_GRAPHEMES is invalid , defaulting to {}. Orignal value = {}", MAX_BSKY_GRAPHEMES,
+                    ai_summary_max_graphemes
+                );
+            }
+            280
+        } else {
+            ai_summary_max_graphemes
+        };
+
+        Ok(Self {
+            dynamodb_table_name,
+            enable_ai_summary,
+            ai_model_id,
+            ai_summary_max_graphemes,
+        })
+    }
+}
+
+#[instrument(skip(event, dynamodb_client, bedrock_client, config))]
+async fn summarize_bedrock(
+    event: LambdaEvent<Input>,
+    dynamodb_client: &DynamoDbClient,
+    bedrock_client: &BedrockClient,
+    config: &Config,
+) -> Result<Output, Error> {
+    if !config.enable_ai_summary {
         return Ok(Output {
             item_identifier: event.payload.item_identifier,
         });
     }
 
-    let ai_summary_max_graphemes: i64 = std::env::var("AI_SUMMARY_MAX_GRAPHEMES")
-        .context("AI_SUMMARY_MAX_GRAPHEMES environment variable not set")
-        .map_err(Error::from)?
-        .parse()
-        .context("Failed to parse AI_SUMMARY_MAX_GRAPHEMES as an integer")
-        .map_err(Error::from)?;
-
-    let ai_model_id: String = env::var("AI_MODEL_ID")
-        .context("AI_MODEL_ID environment variable not set")
-        .map_err(Error::from)?;
-
     //get the ddb entry
     // Retrieve item data from DynamoDB
     let result = dynamodb_client
         .get_item()
-        .table_name(&table_name)
+        .table_name(&config.dynamodb_table_name)
         .key(
             "PK",
             aws_sdk_dynamodb::types::AttributeValue::S(
@@ -92,7 +130,7 @@ async fn summarize_bedrock(event: LambdaEvent<Input>) -> Result<Output, Error> {
     // Prepare the prompt
     let prompt = format!(
     "\n\nHuman: Remove all html tags and summarize the following text in {} graphemes or less:\n\n{}\n\nAssistant:",
-    ai_summary_max_graphemes, description
+    config.ai_summary_max_graphemes, description
 );
     tracing::info!("Prompt: {:?}", prompt);
 
@@ -124,7 +162,7 @@ async fn summarize_bedrock(event: LambdaEvent<Input>) -> Result<Output, Error> {
         .body(aws_sdk_bedrockruntime::primitives::Blob::new(
             request_body_bytes,
         ))
-        .model_id(ai_model_id)
+        .model_id(&config.ai_model_id)
         .content_type("application/json")
         .accept("application/json")
         .send()
@@ -183,7 +221,7 @@ async fn summarize_bedrock(event: LambdaEvent<Input>) -> Result<Output, Error> {
 
     let update_result = dynamodb_client
         .update_item()
-        .table_name(&table_name)
+        .table_name(&config.dynamodb_table_name)
         .key(
             "PK",
             aws_sdk_dynamodb::types::AttributeValue::S(
@@ -213,6 +251,16 @@ async fn summarize_bedrock(event: LambdaEvent<Input>) -> Result<Output, Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    tracing::init_default_subscriber();
-    run(service_fn(summarize_bedrock)).await
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+    let config = Config::from_env().expect("Failed to load configuration");
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let dynamodb_client = DynamoDbClient::new(&aws_config);
+    let bedrock_client = BedrockClient::new(&aws_config);
+    run(service_fn(|event: LambdaEvent<Input>| {
+        summarize_bedrock(event, &dynamodb_client, &bedrock_client, &config)
+    }))
+    .await
 }

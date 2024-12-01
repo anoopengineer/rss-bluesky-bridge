@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ItemIdentifier {
     pub execution_id: String,
     pub guid: String,

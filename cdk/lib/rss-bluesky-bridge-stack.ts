@@ -10,153 +10,150 @@ import { Construct } from 'constructs';
 import * as path from 'path';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Architecture } from 'aws-cdk-lib/aws-lambda';
-
-interface RssBlueskyBridgeStackProps extends cdk.StackProps {
-  feedUrl: string;
-  maxAgeHours: string;
-  enableAISummary: boolean;
-  aiModelId: string;
-  aiSummaryMaxGraphemes: number;
-}
+import { RssBlueskyBridgeStackProps } from './interfaces';
 
 export class RssBlueskyBridgeStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: RssBlueskyBridgeStackProps) {
     super(scope, id, props);
 
-    // Create the secret with dummy values
-    const blueskySecret = new secretsmanager.Secret(
-      this,
-      'BlueskyCredentials',
-      {
-        secretName: 'bluesky-credentials',
-        description: 'Credentials for Bluesky API used by Rss-Bluesky-Bridge',
-        generateSecretString: {
-          secretStringTemplate: JSON.stringify({
-            username: 'dummy_username',
-            password: 'dummy_password',
-          }),
-          generateStringKey: 'dummy', // This key won't be used, it's just to satisfy the API
-        },
-      }
-    );
+    const blueskySecret = this.createBlueskySecret();
+    const table = this.createDynamoDbTable();
 
-    // Create DynamoDB table
-    const table = new dynamodb.Table(this, 'RssBlueskyBridgeTable', {
-      partitionKey: { name: 'PK', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'SK', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      timeToLiveAttribute: 'TTL',
-    });
-
-    // Create Lambda functions
-    const getRssItemsLambda = new RustFunction(this, 'GetRssItemsLambda', {
-      manifestPath: path.join(__dirname, '../../lambda'),
-      binaryName: 'get-rss-items',
-      environment: {
-        FEED_URL: props.feedUrl,
-        DYNAMODB_TABLE_NAME: table.tableName,
-        MAX_AGE_HOURS: props.maxAgeHours,
-      },
-      architecture: Architecture.ARM_64,
-    });
-    table.grantWriteData(getRssItemsLambda);
-
-    const checkDynamoDbLambda = new RustFunction(this, 'CheckDynamoDbLambda', {
-      manifestPath: path.join(__dirname, '../../lambda'),
-      binaryName: 'check-dynamodb',
-      environment: {
-        DYNAMODB_TABLE_NAME: table.tableName,
-      },
-      architecture: Architecture.ARM_64,
-    });
-
-    const summarizeBedrockLambda = new RustFunction(
-      this,
-      'SummarizeBedrockLambda',
-      {
-        manifestPath: path.join(__dirname, '../../lambda'),
-        binaryName: 'summarize-bedrock',
-        environment: {
+    const lambdas = {
+      getRssItems: this.createLambdaFunction(
+        'GetRssItemsLambda',
+        'get-rss-items',
+        {
+          FEED_URL: props.feedUrl,
+          DYNAMODB_TABLE_NAME: table.tableName,
+          MAX_AGE_HOURS: props.maxAgeHours,
+          RUST_LOG: props.logLevel,
+        }
+      ),
+      checkDynamoDb: this.createLambdaFunction(
+        'CheckDynamoDbLambda',
+        'check-dynamodb',
+        {
+          DYNAMODB_TABLE_NAME: table.tableName,
+          RUST_LOG: props.logLevel,
+        }
+      ),
+      summarizeBedrock: this.createLambdaFunction(
+        'SummarizeBedrockLambda',
+        'summarize-bedrock',
+        {
           DYNAMODB_TABLE_NAME: table.tableName,
           ENABLE_AI_SUMMARY: String(props.enableAISummary),
           AI_MODEL_ID: props.aiModelId,
           AI_SUMMARY_MAX_GRAPHEMES: String(props.aiSummaryMaxGraphemes),
-        },
-        architecture: Architecture.ARM_64,
-      }
-    );
-    table.grantReadWriteData(summarizeBedrockLambda);
-    // Add permissions to invoke Bedrock model
-    summarizeBedrockLambda.addToRolePolicy(
+          RUST_LOG: props.logLevel,
+        }
+      ),
+      postBluesky: this.createLambdaFunction(
+        'PostBlueskyLambda',
+        'post-bluesky',
+        {
+          BLUESKY_CREDENTIALS_SECRET_NAME: blueskySecret.secretName,
+          DYNAMODB_TABLE_NAME: table.tableName,
+          RUST_LOG: props.logLevel,
+        }
+      ),
+      updateDynamoDb: this.createLambdaFunction(
+        'UpdateDynamoDbLambda',
+        'update-dynamodb',
+        {
+          DYNAMODB_TABLE_NAME: table.tableName,
+          RUST_LOG: props.logLevel,
+        }
+      ),
+      errorCheck: this.createLambdaFunction('ErrorCheckLambda', 'error-check', {
+        RUST_LOG: props.logLevel,
+      }),
+    };
+
+    // Set up permissions
+    table.grantWriteData(lambdas.getRssItems);
+    table.grantReadData(lambdas.checkDynamoDb);
+    table.grantReadWriteData(lambdas.summarizeBedrock);
+    blueskySecret.grantRead(lambdas.postBluesky);
+    table.grantReadData(lambdas.postBluesky);
+    table.grantWriteData(lambdas.updateDynamoDb);
+
+    lambdas.summarizeBedrock.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['bedrock:InvokeModel'],
         resources: [`arn:aws:bedrock:${this.region}::foundation-model/*`],
       })
     );
 
-    const postBlueskyLambda = new RustFunction(this, 'PostBlueskyLambda', {
-      manifestPath: path.join(__dirname, '../../lambda'),
-      binaryName: 'post-bluesky',
-      environment: {
-        BLUESKY_CREDENTIALS_SECRET_NAME: blueskySecret.secretName,
-        DYNAMODB_TABLE_NAME: table.tableName,
+    const stateMachine = this.createStateMachine(lambdas);
+    this.createScheduleRule(stateMachine);
+  }
+
+  private createBlueskySecret(): secretsmanager.Secret {
+    return new secretsmanager.Secret(this, 'BlueskyCredentials', {
+      secretName: 'bluesky-credentials',
+      description: 'Credentials for Bluesky API used by Rss-Bluesky-Bridge',
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({
+          username: 'dummy_username',
+          password: 'dummy_password',
+        }),
+        generateStringKey: 'dummy',
       },
-      architecture: Architecture.ARM_64,
     });
+  }
 
-    // Grant read access to the secret
-    blueskySecret.grantRead(postBlueskyLambda);
-    table.grantReadData(postBlueskyLambda);
-    const updateDynamoDbLambda = new RustFunction(
-      this,
-      'UpdateDynamoDbLambda',
-      {
-        manifestPath: path.join(__dirname, '../../lambda'),
-        binaryName: 'update-dynamodb',
-        environment: {
-          DYNAMODB_TABLE_NAME: table.tableName,
-        },
-        architecture: Architecture.ARM_64,
-      }
-    );
+  private createDynamoDbTable(): dynamodb.Table {
+    return new dynamodb.Table(this, 'RssBlueskyBridgeTable', {
+      partitionKey: { name: 'PK', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'SK', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'TTL',
+    });
+  }
 
-    // Grant permissions to Lambda functions
-    table.grantReadData(checkDynamoDbLambda);
-    table.grantWriteData(updateDynamoDbLambda);
-
-    const errorCheckLambda = new RustFunction(this, 'ErrorCheckLambda', {
+  private createLambdaFunction(
+    id: string,
+    binaryName: string,
+    environment: Record<string, string>
+  ): RustFunction {
+    return new RustFunction(this, id, {
       manifestPath: path.join(__dirname, '../../lambda'),
-      binaryName: 'error-check',
+      binaryName,
+      environment,
       architecture: Architecture.ARM_64,
     });
+  }
 
-    // Define Step Function tasks
+  private createStateMachine(
+    lambdas: Record<string, RustFunction>
+  ): sfn.StateMachine {
     const getRssItems = new tasks.LambdaInvoke(this, 'GetRSSFeedItems', {
-      lambdaFunction: getRssItemsLambda,
+      lambdaFunction: lambdas.getRssItems,
       resultPath: '$.items',
     });
 
     const checkDynamoDB = new tasks.LambdaInvoke(this, 'CheckDynamoDB', {
-      lambdaFunction: checkDynamoDbLambda,
+      lambdaFunction: lambdas.checkDynamoDb,
       payloadResponseOnly: true,
     });
 
     const summarizeBedrock = new tasks.LambdaInvoke(this, 'SummarizeBedrock', {
-      lambdaFunction: summarizeBedrockLambda,
+      lambdaFunction: lambdas.summarizeBedrock,
       payloadResponseOnly: true,
     });
 
     const postToBluesky = new tasks.LambdaInvoke(this, 'PostToBluesky', {
-      lambdaFunction: postBlueskyLambda,
+      lambdaFunction: lambdas.postBluesky,
       payloadResponseOnly: true,
     });
 
     const updateDynamoDB = new tasks.LambdaInvoke(this, 'UpdateDynamoDB', {
-      lambdaFunction: updateDynamoDbLambda,
+      lambdaFunction: lambdas.updateDynamoDb,
       payloadResponseOnly: true,
     });
 
-    // Define Choice state
     const shouldProcess = new sfn.Choice(this, 'ShouldProcess')
       .when(
         sfn.Condition.booleanEquals('$.should_process', true),
@@ -164,19 +161,16 @@ export class RssBlueskyBridgeStack extends cdk.Stack {
       )
       .otherwise(new sfn.Pass(this, 'SkipProcessing'));
 
-    // Define the item processing workflow
     const processItem = checkDynamoDB.next(shouldProcess);
 
-    // Define Map state
     const processItems = new sfn.Map(this, 'ProcessItems', {
       itemsPath: '$.items.Payload.item_identifiers',
       resultPath: '$.processed_items',
       maxConcurrency: 1,
     }).iterator(processItem);
 
-    // Define final error check
     const errorCheck = new tasks.LambdaInvoke(this, 'ErrorCheck', {
-      lambdaFunction: errorCheckLambda,
+      lambdaFunction: lambdas.errorCheck,
       resultPath: '$.errorCheckResult',
     });
 
@@ -193,18 +187,15 @@ export class RssBlueskyBridgeStack extends cdk.Stack {
       )
       .otherwise(new sfn.Pass(this, 'SuccessfulExecution'));
 
-    // Define the state machine
-    const stateMachine = new sfn.StateMachine(
-      this,
-      'RssBlueskyBridgeStateMachine',
-      {
-        definition: getRssItems
-          .next(processItems)
-          .next(errorCheck)
-          .next(finalErrorCheck),
-      }
-    );
+    return new sfn.StateMachine(this, 'RssBlueskyBridgeStateMachine', {
+      definition: getRssItems
+        .next(processItems)
+        .next(errorCheck)
+        .next(finalErrorCheck),
+    });
+  }
 
+  private createScheduleRule(stateMachine: sfn.StateMachine): void {
     new events.Rule(this, 'ScheduleRule', {
       schedule: events.Schedule.cron({ minute: '0', hour: '*/6' }),
       targets: [new targets.SfnStateMachine(stateMachine)],

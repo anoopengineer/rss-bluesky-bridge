@@ -15,6 +15,7 @@ The `cdk.json` file tells the CDK Toolkit how to execute your app.
 
 
 # Sample trigger json
+```json
 {
   "version": "0",
   "id": "12345678-1234-1234-1234-123456789012",
@@ -28,3 +29,5 @@ The `cdk.json` file tells the CDK Toolkit how to execute your app.
   ],
   "detail": {}
 }
+
+```

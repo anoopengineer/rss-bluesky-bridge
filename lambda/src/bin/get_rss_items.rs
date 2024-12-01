@@ -1,3 +1,4 @@
+use ::tracing::instrument;
 use anyhow::Context;
 use aws_config::BehaviorVersion;
 use aws_lambda_events::event::cloudwatch_events::CloudWatchEvent;
@@ -9,13 +10,67 @@ use rss::Channel;
 use rss_bluesky_bridge::models::{ItemIdentifier, RssItem};
 use serde::Serialize;
 use std::env;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Serialize)]
 struct Output {
     item_identifiers: Vec<ItemIdentifier>,
 }
 
-async fn get_rss_items(event: LambdaEvent<CloudWatchEvent>) -> Result<Output, Error> {
+struct Config {
+    dynamodb_table_name: String,
+    max_age_hours: i64,
+    feed_url: String,
+}
+
+impl Config {
+    fn from_env() -> Result<Self, Error> {
+        let dynamodb_table_name = std::env::var("DYNAMODB_TABLE_NAME")
+            .context("DYNAMODB_TABLE_NAME environment variable not set")?;
+
+        if dynamodb_table_name.is_empty() {
+            return Err(Error::from("DYNAMODB_TABLE_NAME cannot be empty"));
+        }
+
+        let max_age_hours: i64 = std::env::var("MAX_AGE_HOURS")
+            .context("MAX_AGE_HOURS environment variable not set")
+            .map_err(Error::from)?
+            .parse()
+            .context("Failed to parse MAX_AGE_HOURS as an integer")
+            .map_err(Error::from)?;
+
+        let max_age_hours = if max_age_hours <= 0 {
+            tracing::warn!(
+                "MAX_AGE_HOURS is set to 0 or less, defaulting to 24 hours. Orignal value = {}",
+                max_age_hours
+            );
+            48
+        } else {
+            max_age_hours
+        };
+
+        let feed_url: String = env::var("FEED_URL")
+            .context("FEED_URL environment variable not set")
+            .map_err(Error::from)?;
+
+        if feed_url.trim().is_empty() {
+            return Err(Error::from("FEED_URL is not provided"));
+        }
+
+        Ok(Self {
+            dynamodb_table_name,
+            max_age_hours,
+            feed_url,
+        })
+    }
+}
+
+#[instrument(skip(event, dynamodb_client, config))]
+async fn get_rss_items(
+    event: LambdaEvent<CloudWatchEvent>,
+    dynamodb_client: &Client,
+    config: &Config,
+) -> Result<Output, Error> {
     tracing::info!("Payload: {:?}", event.payload);
     let execution_id = event
         .payload
@@ -23,26 +78,9 @@ async fn get_rss_items(event: LambdaEvent<CloudWatchEvent>) -> Result<Output, Er
         .ok_or_else(|| Error::from("Execution ID not provided in the event payload"))?;
     tracing::info!("Execution id: {:?}", execution_id);
 
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let dynamodb_client = Client::new(&config);
-    let table_name = std::env::var("DYNAMODB_TABLE_NAME")
-        .context("DYNAMODB_TABLE_NAME environment variable not set")
-        .map_err(Error::from)?;
-
-    let max_age_hours: i64 = std::env::var("MAX_AGE_HOURS")
-        .context("MAX_AGE_HOURS environment variable not set")
-        .map_err(Error::from)?
-        .parse()
-        .context("Failed to parse MAX_AGE_HOURS as an integer")
-        .map_err(Error::from)?;
-
-    let feed_url: String = env::var("FEED_URL")
-        .context("FEED_URL environment variable not set")
-        .map_err(Error::from)?;
-
-    let content = reqwest::get(&feed_url)
+    let content = reqwest::get(&config.feed_url)
         .await
-        .with_context(|| format!("Failed to fetch RSS feed from {}", feed_url))
+        .with_context(|| format!("Failed to fetch RSS feed from {}", config.feed_url))
         .map_err(Error::from)?
         .text()
         .await
@@ -61,7 +99,7 @@ async fn get_rss_items(event: LambdaEvent<CloudWatchEvent>) -> Result<Output, Er
             let pub_date = DateTime::parse_from_rfc2822(&pub_date).ok()?;
             let age = Utc::now().signed_duration_since(pub_date);
 
-            if age.num_hours() <= max_age_hours {
+            if age.num_hours() <= config.max_age_hours {
                 Some(RssItem {
                     guid: item.guid()?.value().to_string(),
                     title: item.title()?.to_string(),
@@ -108,7 +146,7 @@ async fn get_rss_items(event: LambdaEvent<CloudWatchEvent>) -> Result<Output, Er
         // Store item in DynamoDB
         dynamodb_client
             .put_item()
-            .table_name(&table_name)
+            .table_name(&config.dynamodb_table_name)
             .set_item(Some(item_data))
             .send()
             .await?;
@@ -125,6 +163,17 @@ async fn get_rss_items(event: LambdaEvent<CloudWatchEvent>) -> Result<Output, Er
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    tracing::init_default_subscriber();
-    run(service_fn(get_rss_items)).await
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let config = Config::from_env().expect("Failed to load configuration");
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let dynamodb_client = Client::new(&aws_config);
+
+    run(service_fn(|event: LambdaEvent<CloudWatchEvent>| {
+        get_rss_items(event, &dynamodb_client, &config)
+    }))
+    .await
 }

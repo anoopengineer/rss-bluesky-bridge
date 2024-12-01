@@ -71,7 +71,12 @@ AI_SUMMARY_MAX_GRAPHEMES=100
 
 ```bash    
 cd cdk
-ENV=prod npx cdk deploy
+
+# deploy to production aws account
+npm run deploy-prod
+
+# deploy to dev aws account
+npm run deploy
 ```
     
 

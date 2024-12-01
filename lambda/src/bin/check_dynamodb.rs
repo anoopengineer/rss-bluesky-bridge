@@ -1,14 +1,11 @@
 use anyhow::Context;
 use aws_config::BehaviorVersion;
-use aws_sdk_dynamodb::{types::AttributeValue, Client};
+use aws_sdk_dynamodb::Client;
 use lambda_runtime::{run, service_fn, Error, LambdaEvent};
+use rss_bluesky_bridge::{dynamodb_handler, models::ItemIdentifier};
 use serde::{Deserialize, Serialize};
-
-#[derive(Deserialize, Serialize)]
-struct ItemIdentifier {
-    execution_id: String,
-    guid: String,
-}
+use tracing::instrument;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Deserialize)]
 struct Input {
@@ -23,35 +20,66 @@ struct Output {
     should_process: bool,
 }
 
-async fn check_dynamodb(event: LambdaEvent<Input>) -> Result<Output, Error> {
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let client = Client::new(&config);
-    let table_name = std::env::var("DYNAMODB_TABLE_NAME")
-        .context("DYNAMODB_TABLE_NAME environment variable not set")
-        .map_err(Error::from)?;
+struct Config {
+    dynamodb_table_name: String,
+}
 
-    let guid_result = client
-        .get_item()
-        .table_name(&table_name)
-        .key(
-            "PK",
-            AttributeValue::S(format!("guid-{}", event.payload.item_identifier.guid)),
-        )
-        .key("SK", AttributeValue::S("A".to_string()))
-        .send()
-        .await
-        .context("Failed to get response from DynamoDB for guid check")
-        .map_err(Error::from)?;
+impl Config {
+    fn from_env() -> Result<Self, Error> {
+        let dynamodb_table_name = std::env::var("DYNAMODB_TABLE_NAME")
+            .context("DYNAMODB_TABLE_NAME environment variable not set")?;
 
-    let guid_exists: bool = guid_result.item().is_some();
+        if dynamodb_table_name.is_empty() {
+            return Err(Error::from("DYNAMODB_TABLE_NAME cannot be empty"));
+        }
 
-    Ok(Output {
+        Ok(Self {
+            dynamodb_table_name,
+        })
+    }
+}
+
+#[instrument(skip(event, dynamodb_client, config))]
+async fn check_dynamodb(
+    event: LambdaEvent<Input>,
+    dynamodb_client: &Client,
+    config: &Config,
+) -> Result<Output, Error> {
+    let guid = event.payload.item_identifier.guid.clone();
+    tracing::info!("Checking DynamoDB for guid: {}", guid);
+
+    let guid_exists =
+        dynamodb_handler::check_guid_exists(dynamodb_client, &config.dynamodb_table_name, &guid)
+            .await
+            .with_context(|| format!("Failed to check if guid exists in DynamoDB: {}", guid))?;
+
+    let output = Output {
         item_identifier: event.payload.item_identifier,
         should_process: !guid_exists,
-    })
+    };
+
+    tracing::info!(
+        "Check result: should_process is {} for guid {}",
+        output.should_process,
+        guid
+    );
+
+    Ok(output)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    run(service_fn(check_dynamodb)).await
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let config = Config::from_env().expect("Failed to load configuration");
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let dynamodb_client = Client::new(&aws_config);
+
+    run(service_fn(|event: LambdaEvent<Input>| {
+        check_dynamodb(event, &dynamodb_client, &config)
+    }))
+    .await
 }

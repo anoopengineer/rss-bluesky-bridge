@@ -1,9 +1,10 @@
-use aws_sdk_dynamodb::types::AttributeValue;
+use crate::models::{ItemIdentifier, RssItem};
+use aws_sdk_dynamodb::error::{BuildError, SdkError};
+use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemError;
+use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
 use aws_sdk_dynamodb::{Client, Error};
 use chrono::{Duration, Utc};
 use std::collections::HashMap;
-
-use crate::models::{ItemIdentifier, RssItem};
 
 pub async fn store_item_in_dynamodb(
     client: &Client,
@@ -65,11 +66,11 @@ pub async fn batch_write_items(
     client: &Client,
     table_name: &str,
     items: &[ItemIdentifier],
-) -> Result<(), Error> {
+) -> Result<(), SdkError<BatchWriteItemError>> {
     // DynamoDB allows a maximum of 25 items per batch write
     for chunk in items.chunks(25) {
         let mut request_items = HashMap::new();
-        let put_requests: Vec<_> = chunk
+        let put_requests: Result<Vec<_>, BuildError> = chunk
             .iter()
             .map(|item| {
                 let mut item_data = HashMap::new();
@@ -83,15 +84,13 @@ pub async fn batch_write_items(
                     AttributeValue::S(item.execution_id.clone()),
                 );
 
-                aws_sdk_dynamodb::model::WriteRequest::builder()
-                    .put_request(
-                        aws_sdk_dynamodb::model::PutRequest::builder()
-                            .set_item(Some(item_data))
-                            .build(),
-                    )
-                    .build()
+                let put_request = PutRequest::builder().set_item(Some(item_data)).build()?;
+
+                Ok(WriteRequest::builder().put_request(put_request).build())
             })
             .collect();
+
+        let put_requests = put_requests.map_err(|e| SdkError::construction_failure(e))?;
 
         request_items.insert(table_name.to_string(), put_requests);
 

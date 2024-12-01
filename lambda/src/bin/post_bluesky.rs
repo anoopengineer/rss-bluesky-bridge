@@ -1,3 +1,4 @@
+use ::tracing::instrument;
 use anyhow::Context;
 use atrium_api::app::bsky::embed::external::External;
 use atrium_api::app::bsky::embed::external::ExternalData;
@@ -11,15 +12,11 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use bsky_sdk::rich_text::RichText;
 use bsky_sdk::BskyAgent;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
+use rss_bluesky_bridge::models::ItemIdentifier;
 use serde::{Deserialize, Serialize};
 use std::env;
+use tracing_subscriber::EnvFilter;
 use unicode_segmentation::UnicodeSegmentation;
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-struct ItemIdentifier {
-    execution_id: String,
-    guid: String,
-}
 
 #[derive(Deserialize)]
 struct Input {
@@ -34,26 +31,53 @@ struct Output {
     uri: String,
 }
 
-async fn post_bluesky(event: LambdaEvent<Input>) -> Result<Output, Error> {
+struct Config {
+    dynamodb_table_name: String,
+    secret_name: String,
+}
+
+impl Config {
+    fn from_env() -> Result<Self, Error> {
+        let dynamodb_table_name = std::env::var("DYNAMODB_TABLE_NAME")
+            .context("DYNAMODB_TABLE_NAME environment variable not set")?;
+
+        if dynamodb_table_name.trim().is_empty() {
+            return Err(Error::from("DYNAMODB_TABLE_NAME cannot be empty"));
+        }
+
+        let secret_name = env::var("BLUESKY_CREDENTIALS_SECRET_NAME")
+            .context("BLUESKY_CREDENTIALS_SECRET_NAME environment variable not set")
+            .map_err(Error::from)?;
+
+        if secret_name.trim().is_empty() {
+            return Err(Error::from(
+                "BLUESKY_CREDENTIALS_SECRET_NAME cannot be empty",
+            ));
+        }
+
+        Ok(Self {
+            dynamodb_table_name,
+            secret_name,
+        })
+    }
+}
+
+#[instrument(skip(event, dynamodb_client, config))]
+async fn post_bluesky(
+    event: LambdaEvent<Input>,
+    dynamodb_client: &DynamoDbClient,
+    secrets_client: &SecretsManagerClient,
+    config: &Config,
+) -> Result<Output, Error> {
     tracing::info!(
         "Posting to Bluesky for item: {:?}",
         event.payload.item_identifier
     );
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let dynamodb_client = DynamoDbClient::new(&config);
-    let secrets_client = SecretsManagerClient::new(&config);
-
-    let table_name = env::var("DYNAMODB_TABLE_NAME")
-        .context("DYNAMODB_TABLE_NAME environment variable not set")
-        .map_err(Error::from)?;
-    let secret_name = env::var("BLUESKY_CREDENTIALS_SECRET_NAME")
-        .context("BLUESKY_CREDENTIALS_SECRET_NAME environment variable not set")
-        .map_err(Error::from)?;
 
     // Retrieve item data from DynamoDB
     let result = dynamodb_client
         .get_item()
-        .table_name(&table_name)
+        .table_name(&config.dynamodb_table_name)
         .key(
             "PK",
             aws_sdk_dynamodb::types::AttributeValue::S(
@@ -123,7 +147,7 @@ async fn post_bluesky(event: LambdaEvent<Input>) -> Result<Output, Error> {
     // Get Bluesky credentials
     let secret = secrets_client
         .get_secret_value()
-        .secret_id(secret_name)
+        .secret_id(&config.secret_name)
         .send()
         .await
         .context("Failed to retrieve secret")
@@ -204,6 +228,17 @@ async fn post_bluesky(event: LambdaEvent<Input>) -> Result<Output, Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    tracing::init_default_subscriber();
-    run(service_fn(post_bluesky)).await
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let config = Config::from_env().expect("Failed to load configuration");
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let dynamodb_client = DynamoDbClient::new(&aws_config);
+    let secrets_client = SecretsManagerClient::new(&aws_config);
+    run(service_fn(|event: LambdaEvent<Input>| {
+        post_bluesky(event, &dynamodb_client, &secrets_client, &config)
+    }))
+    .await
 }

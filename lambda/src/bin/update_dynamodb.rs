@@ -1,14 +1,11 @@
+use ::tracing::instrument;
 use anyhow::Context;
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::{types::AttributeValue, Client};
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
+use rss_bluesky_bridge::models::ItemIdentifier;
 use serde::{Deserialize, Serialize};
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-struct ItemIdentifier {
-    execution_id: String,
-    guid: String,
-}
+use tracing_subscriber::EnvFilter;
 
 #[derive(Deserialize)]
 struct Input {
@@ -22,17 +19,33 @@ struct Output {
     item_identifier: ItemIdentifier,
 }
 
-async fn update_dynamodb(event: LambdaEvent<Input>) -> Result<Output, Error> {
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let client = Client::new(&config);
+struct Config {
+    dynamodb_table_name: String,
+}
 
-    let table_name = std::env::var("DYNAMODB_TABLE_NAME")
-        .context("DYNAMODB_TABLE_NAME environment variable not set")
-        .map_err(Error::from)?;
+impl Config {
+    fn from_env() -> Result<Self, Error> {
+        let dynamodb_table_name = std::env::var("DYNAMODB_TABLE_NAME")
+            .context("DYNAMODB_TABLE_NAME environment variable not set")?;
 
-    client
+        if dynamodb_table_name.is_empty() {
+            return Err(Error::from("DYNAMODB_TABLE_NAME cannot be empty"));
+        }
+
+        Ok(Self {
+            dynamodb_table_name,
+        })
+    }
+}
+#[instrument(skip(event, dynamodb_client, config))]
+async fn update_dynamodb(
+    event: LambdaEvent<Input>,
+    dynamodb_client: &Client,
+    config: &Config,
+) -> Result<Output, Error> {
+    dynamodb_client
         .put_item()
-        .table_name(table_name)
+        .table_name(&config.dynamodb_table_name)
         .item(
             "PK",
             AttributeValue::S(format!(
@@ -56,6 +69,17 @@ async fn update_dynamodb(event: LambdaEvent<Input>) -> Result<Output, Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    tracing::init_default_subscriber();
-    run(service_fn(update_dynamodb)).await
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let config = Config::from_env().expect("Failed to load configuration");
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let dynamodb_client = Client::new(&aws_config);
+
+    run(service_fn(|event: LambdaEvent<Input>| {
+        update_dynamodb(event, &dynamodb_client, &config)
+    }))
+    .await
 }
