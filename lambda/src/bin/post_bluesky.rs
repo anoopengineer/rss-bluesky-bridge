@@ -14,10 +14,12 @@ use bsky_sdk::BskyAgent;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
 use rss_bluesky_bridge::models::ItemIdentifier;
 use rss_bluesky_bridge::repository::DynamoRepository;
+use rss_bluesky_bridge::text_utils::truncate_to_word;
 use serde::{Deserialize, Serialize};
 use std::env;
 use tracing_subscriber::EnvFilter;
-use unicode_segmentation::UnicodeSegmentation;
+
+const MAX_BSKY_GRAPHEMES: usize = 300; //accommodates the two new lines we add at end
 
 #[derive(Deserialize)]
 struct Input {
@@ -98,30 +100,10 @@ async fn post_bluesky(
         Some(s) if !s.trim().is_empty() => s,
         _ => {
             tracing::info!("AI generated summary unavailable. Generating summary from description");
-            let words: Vec<&str> = description.split_word_bounds().collect();
-            let mut char_count = 0;
-            let mut word_index = 0;
-
-            while word_index < words.len() && char_count + words[word_index].len() <= 99 {
-                char_count += words[word_index].len();
-                word_index += 1;
-            }
-
-            if word_index < words.len() {
-                format!("{}…", words[..word_index].join(""))
-            } else {
-                description.clone()
-            }
+            truncate_to_word(description.as_str(), MAX_BSKY_GRAPHEMES)
         }
     };
     tracing::info!("Using summary: {}", summary);
-
-    // Construct the post content
-    let post = format!("{}\n\n", summary);
-    tracing::info!(
-        "Number of graphemes in post: {}",
-        post.graphemes(true).count()
-    );
 
     // Get Bluesky credentials
     let secret = secrets_client
@@ -150,7 +132,7 @@ async fn post_bluesky(
         .map_err(Error::from)?;
 
     // Create Bluesky post
-    let rt = RichText::new_with_detect_facets(post)
+    let rt = RichText::new_with_detect_facets(summary)
         .await
         .context("Failed to create RichText")
         .map_err(Error::from)?;

@@ -4,6 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
+use rss_bluesky_bridge::text_utils::truncate_to_word;
 use rss_bluesky_bridge::{models::ItemIdentifier, repository::DynamoRepository};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -159,40 +160,10 @@ async fn summarize_bedrock(
     tracing::info!("Parsed response body: {:?}", response_body);
     let summary = response_body["content"][0]["text"]
         .as_str()
-        .unwrap_or("No summary generated");
+        .unwrap_or(&description);
 
     tracing::info!("Summary before trimming:\n{}", summary);
-    let num_graphemes = summary.graphemes(true).count();
-    tracing::info!(
-        "Number of graphemes before trimming in summary: {}",
-        num_graphemes
-    );
-
-    // Trim the summary to 300 graphemes
-    let summary = if num_graphemes > MAX_BSKY_GRAPHEMES {
-        let mut graphemes = summary.graphemes(true).collect::<Vec<&str>>();
-        while graphemes.len() > MAX_BSKY_GRAPHEMES - 1 {
-            // -1 so that we can accommodate the ellipsis
-            graphemes.pop();
-        }
-
-        // Find the last space to avoid cutting words
-        let mut last_space_index = graphemes.len();
-        while last_space_index > 0 && graphemes[last_space_index - 1] != " " {
-            last_space_index -= 1;
-        }
-
-        // If we found a space, use it as the cut-off point
-        if last_space_index > 0 {
-            graphemes.truncate(last_space_index);
-        }
-
-        let mut trimmed = graphemes.join("");
-        trimmed.push('…'); // Add ellipsis
-        trimmed
-    } else {
-        summary.to_string()
-    };
+    let summary = truncate_to_word(summary, MAX_BSKY_GRAPHEMES);
 
     tracing::info!("Summary after trimming:\n{}", summary);
     let num_graphemes = summary.graphemes(true).count();
